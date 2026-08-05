@@ -365,6 +365,21 @@ type TransportDispatcher interface {
 	DeliverRawPacket(tcpip.TransportProtocolNumber, *PacketBuffer)
 }
 
+// TransportDispatcherWithDefaultHandlerResult extends TransportDispatcher with
+// default-handler-specific delivery metadata.
+type TransportDispatcherWithDefaultHandlerResult interface {
+	TransportDispatcher
+
+	// DeliverTransportPacketWithDefaultHandlerResult delivers packets to the
+	// appropriate transport protocol endpoint and reports whether the packet was
+	// specifically handled by the per-stack default transport protocol handler.
+	//
+	// pkt.NetworkHeader must be set before calling this method.
+	//
+	// DeliverTransportPacketWithDefaultHandlerResult may modify the packet.
+	DeliverTransportPacketWithDefaultHandlerResult(tcpip.TransportProtocolNumber, *PacketBuffer) (TransportPacketDisposition, bool)
+}
+
 // PacketLooping specifies where an outbound packet should be sent.
 type PacketLooping byte
 
@@ -872,6 +887,9 @@ type NetworkEndpoint interface {
 	// minus the network endpoint max header length.
 	MTU() uint32
 
+	// EndpointHeaderSize returns the size of this endpoint header.
+	EndpointHeaderSize() uint32
+
 	// MaxHeaderLength returns the maximum size the network (and lower
 	// level layers combined) headers can have. Higher levels use this
 	// information to reserve space in the front of the packets they're
@@ -1135,7 +1153,6 @@ const (
 	CapabilityRXChecksumOffload
 	CapabilityResolutionRequired
 	CapabilitySaveRestore
-	CapabilityDisconnectOk
 	CapabilityLoopback
 )
 

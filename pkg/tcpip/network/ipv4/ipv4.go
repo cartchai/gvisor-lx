@@ -26,6 +26,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/log"
 	"github.com/sagernet/gvisor/pkg/sync"
 	"github.com/sagernet/gvisor/pkg/tcpip"
+	"github.com/sagernet/gvisor/pkg/tcpip/checksum"
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
 	"github.com/sagernet/gvisor/pkg/tcpip/header/parse"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/hash"
@@ -84,6 +85,7 @@ var (
 	_ IGMPEndpoint                             = (*endpoint)(nil)
 )
 
+// +checklocksalias:igmp.ep.mu=mu
 // +stateify savable
 type endpoint struct {
 	nic        stack.NetworkInterface
@@ -128,13 +130,11 @@ func (e *endpoint) GetIGMPVersion() IGMPVersion {
 }
 
 // +checklocks:e.mu
-// +checklocksalias:e.igmp.ep.mu=e.mu
 func (e *endpoint) setIGMPVersionLocked(v IGMPVersion) IGMPVersion {
 	return e.igmp.setVersion(v)
 }
 
 // +checklocksread:e.mu
-// +checklocksalias:e.igmp.ep.mu=e.mu
 func (e *endpoint) getIGMPVersionLocked() IGMPVersion {
 	return e.igmp.getVersion()
 }
@@ -293,7 +293,6 @@ func (e *endpoint) Enable() tcpip.Error {
 }
 
 // +checklocks:e.mu
-// +checklocksalias:e.igmp.ep.mu=e.mu
 func (e *endpoint) enableLocked() tcpip.Error {
 	// If the NIC is not enabled, the endpoint can't do anything meaningful so
 	// don't enable the endpoint.
@@ -364,7 +363,6 @@ func (e *endpoint) Disable() {
 }
 
 // +checklocks:e.mu
-// +checklocksalias:e.igmp.ep.mu=e.mu
 func (e *endpoint) disableLocked() {
 	if !e.isEnabled() {
 		return
@@ -426,6 +424,11 @@ func (e *endpoint) MTU() uint32 {
 		return 0
 	}
 	return networkMTU
+}
+
+// EndpointHeaderSize returns the size necessary for the IPv4 header.
+func (e *endpoint) EndpointHeaderSize() uint32 {
+	return header.IPv4MinimumSize
 }
 
 // MaxHeaderLength returns the maximum length needed by ipv4 headers (and
@@ -519,6 +522,48 @@ func (e *endpoint) handleFragments(_ *stack.Route, networkMTU uint32, pkt *stack
 	}
 }
 
+// recalculateChecksum recalculates the checksum of a TCP packet.
+func recalculateChecksum(pkt *stack.PacketBuffer, r *stack.Route) tcpip.Error {
+	// RXChecksumValidated indicates that checksum verification may be
+	// safely skipped.
+	if pkt.RXChecksumValidated {
+		return nil
+	}
+	// NeedsCsum is set if the checksum offload is enabled, so no need to
+	// calculate the checksum.
+	if pkt.GSOOptions.Type != stack.GSONone && pkt.GSOOptions.NeedsCsum {
+		return nil
+	}
+	transportHeader := pkt.TransportHeader().Slice()
+	netHdr := header.IPv4(pkt.NetworkHeader().Slice())
+	switch pkt.TransportProtocolNumber {
+	case header.TCPProtocolNumber:
+		if len(transportHeader) < header.TCPMinimumSize {
+			return &tcpip.ErrMalformedHeader{}
+		}
+		tcp := header.TCP(transportHeader)
+		xsum := r.PseudoHeaderChecksum(header.TCPProtocolNumber, netHdr.PayloadLength())
+		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
+		tcp.SetChecksum(0)
+		tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
+	case header.UDPProtocolNumber:
+		if len(transportHeader) < header.UDPMinimumSize {
+			return &tcpip.ErrMalformedHeader{}
+		}
+		udp := header.UDP(transportHeader)
+		xsum := r.PseudoHeaderChecksum(header.UDPProtocolNumber, netHdr.PayloadLength())
+		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
+		udp.SetChecksum(0)
+		csum := ^udp.CalculateChecksum(xsum)
+		// RFC 768: If the computed checksum is zero, it is transmitted as all ones.
+		if csum == 0 {
+			csum = 0xFFFF
+		}
+		udp.SetChecksum(csum)
+	}
+	return nil
+}
+
 // WritePacket writes a packet to the given destination address and protocol.
 func (e *endpoint) WritePacket(r *stack.Route, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) tcpip.Error {
 	if err := e.addIPHeader(r.LocalAddress(), r.RemoteAddress(), pkt, params, nil /* options */); err != nil {
@@ -531,14 +576,21 @@ func (e *endpoint) WritePacket(r *stack.Route, params stack.NetworkHeaderParams,
 func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer) tcpip.Error {
 	netHeader := header.IPv4(pkt.NetworkHeader().Slice())
 	dstAddr := netHeader.DestinationAddress()
+	stk := e.protocol.stack
 
-	// iptables filtering. All packets that reach here are locally
-	// generated.
-	outNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-	if ok := e.protocol.stack.IPTables().CheckOutput(pkt, r, outNicName); !ok {
+	// iptables filtering. All packets that reach here are locally generated.
+	outNicName := stk.FindNICNameFromID(e.nic.ID())
+	if ok := stk.IPTables().CheckOutput(pkt, r, outNicName); !ok {
 		// iptables is telling us to drop the packet.
 		e.stats.ip.IPTablesOutputDropped.Increment()
 		return nil
+	}
+
+	if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
+		if !nft.CheckOutput(pkt, r, stack.IP) {
+			// nftables is telling us to drop the packet.
+			return nil
+		}
 	}
 
 	// If the packet is manipulated as per DNAT Output rules, handle packet
@@ -555,6 +607,37 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer) tcpip.Er
 			ep.handleLocalPacket(pkt, true /* canSkipRXChecksum */)
 			return nil
 		}
+
+		// Similar to the `ip_route_me_harder` in the kernel,
+		// we need to find a new route for the packet.
+		// Implementation is similar to the func forwardUnicastPacket.
+		stk := e.protocol.stack
+		newRoute, err := stk.FindRoute(0 /* nic id */, netHeader.SourceAddress(), newDstAddr, header.IPv4ProtocolNumber, false /* multicastLoop */)
+		if err != nil {
+			return err // Drop the packet
+		}
+		// Release the new route on exit.
+		defer newRoute.Release()
+
+		// Check if we need to recalculate the checksum.
+		// If the original route did not require a checksum but the new one does,
+		// we must calculate the full checksum; otherwise, NAT should have already
+		// done it.
+		if !r.RequiresTXTransportChecksum() && newRoute.RequiresTXTransportChecksum() {
+			if err := recalculateChecksum(pkt, newRoute); err != nil {
+				return err // Drop the packet
+			}
+		}
+
+		// Update the route to the new route.
+		r = newRoute
+
+		// Use the new endpoint to write the packet.
+		forwardToEp, ok := e.protocol.getEndpointForNIC(r.NICID())
+		if !ok {
+			return &tcpip.ErrUnknownNICID{}
+		}
+		return forwardToEp.writePacketPostRouting(r, pkt, true /* headerIncluded */)
 	}
 
 	return e.writePacketPostRouting(r, pkt, false /* headerIncluded */)
@@ -571,13 +654,21 @@ func (e *endpoint) writePacketPostRouting(r *stack.Route, pkt *stack.PacketBuffe
 		return nil
 	}
 
+	stk := e.protocol.stack
 	// Postrouting NAT can only change the source address, and does not alter the
 	// route or outgoing interface of the packet.
-	outNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-	if ok := e.protocol.stack.IPTables().CheckPostrouting(pkt, r, e, outNicName); !ok {
+	outNicName := stk.FindNICNameFromID(e.nic.ID())
+	if ok := stk.IPTables().CheckPostrouting(pkt, r, e, outNicName); !ok {
 		// iptables is telling us to drop the packet.
 		e.stats.ip.IPTablesPostroutingDropped.Increment()
 		return nil
+	}
+
+	if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
+		if !nft.CheckPostrouting(pkt, r, stack.IP) {
+			// nftables is telling us to drop the packet.
+			return nil
+		}
 	}
 
 	stats := e.stats.ip
@@ -690,6 +781,13 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		return nil
 	}
 
+	if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
+		if !nft.CheckForward(pkt, route, stack.IP) {
+			// nftables is telling us to drop the packet.
+			return nil
+		}
+	}
+
 	// We need to do a deep copy of the IP packet because
 	// WriteHeaderIncludedPacket may modify the packet buffer, but we do
 	// not own it.
@@ -725,6 +823,10 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 	newHdr.SetChecksum(0)
 	newHdr.SetChecksum(^newHdr.CalculateChecksum())
 
+	if route.RequiresTXTransportChecksum() {
+		newPkt.CalculateTransportChecksum()
+	}
+
 	switch err := forwardToEp.writePacketPostRouting(route, newPkt, true /* headerIncluded */); err.(type) {
 	case nil:
 		return nil
@@ -738,7 +840,9 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		// WriteHeaderIncludedPacket checks for the presence of the Don't Fragment bit
 		// while sending the packet and returns this error iff fragmentation is
 		// necessary and the bit is also set.
-		_ = e.protocol.returnError(&icmpReasonFragmentationNeeded{}, pkt, false /* deliveredLocally */)
+		_ = e.protocol.returnError(&icmpReasonFragmentationNeeded{
+			mtu: forwardToEp.nic.MTU(),
+		}, pkt, false /* deliveredLocally */)
 		return &ip.ErrMessageTooLong{}
 	case *tcpip.ErrNoBufferSpace:
 		return &ip.ErrOutgoingDeviceNoBufferSpace{}
@@ -788,6 +892,13 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 			// iptables is telling us to drop the packet.
 			e.stats.ip.IPTablesForwardDropped.Increment()
 			return nil
+		}
+
+		if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
+			if !nft.CheckForward(pkt, nil /* route */, stack.IP) {
+				// nftables is telling us to drop the packet.
+				return nil
+			}
 		}
 
 		// The packet originally arrived on e so provide its NIC as the input NIC.
@@ -857,7 +968,8 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 			}
 		}
 
-		if e.protocol.stack.HandleLocal() {
+		stk := e.protocol.stack
+		if stk.HandleLocal() {
 			addressEndpoint := e.AcquireAssignedAddress(header.IPv4(pkt.NetworkHeader().Slice()).SourceAddress(), e.nic.Promiscuous(), stack.CanBePrimaryEndpoint, true /* readOnly */)
 			if addressEndpoint != nil {
 				// The source address is one of our own, so we never should have gotten
@@ -868,12 +980,21 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 			}
 		}
 
+		nicID := e.nic.ID()
 		// Loopback traffic skips the prerouting chain.
-		inNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
-		if ok := e.protocol.stack.IPTables().CheckPrerouting(pkt, e, inNicName); !ok {
+		inNicName := stk.FindNICNameFromID(nicID)
+		pkt.InputNICID = nicID
+		if ok := stk.IPTables().CheckPrerouting(pkt, e, inNicName); !ok {
 			// iptables is telling us to drop the packet.
 			stats.IPTablesPreroutingDropped.Increment()
 			return
+		}
+
+		if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
+			if !nft.CheckPrerouting(pkt, nil /* route */, stack.IP) {
+				// nftables is telling us to drop the packet.
+				return
+			}
 		}
 	}
 	// CheckPrerouting can modify the backing storage of the packet, so refresh
@@ -1208,12 +1329,20 @@ func (e *endpoint) handleForwardingError(err ip.ForwardingError) {
 
 func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, inNICName string) {
 	stats := e.stats
+	stk := e.protocol.stack
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and will not be forwarded.
-	if ok := e.protocol.stack.IPTables().CheckInput(pkt, inNICName); !ok {
+	if ok := stk.IPTables().CheckInput(pkt, inNICName); !ok {
 		// iptables is telling us to drop the packet.
 		stats.ip.IPTablesInputDropped.Increment()
 		return
+	}
+
+	if nft := stk.NFTables(); nft != nil && stk.IsNFTablesConfigured() {
+		if !nft.CheckInput(pkt, nil /* route */, stack.IP) {
+			// nftables is telling us to drop the packet.
+			return
+		}
 	}
 
 	if h.More() || h.FragmentOffset() != 0 {
@@ -1327,7 +1456,7 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 	}
 	if p == header.IGMPProtocolNumber {
 		e.mu.Lock()
-		e.igmp.handleIGMP(pkt, hasRouterAlertOption) // +checklocksforce: e == e.igmp.ep.
+		e.igmp.handleIGMP(pkt, hasRouterAlertOption)
 		e.mu.Unlock()
 		return
 	}
@@ -1377,7 +1506,6 @@ func (e *endpoint) AddAndAcquirePermanentAddress(addr tcpip.AddressWithPrefix, p
 // sendQueuedReports sends queued igmp reports.
 //
 // +checklocks:e.mu
-// +checklocksalias:e.igmp.ep.mu=e.mu
 func (e *endpoint) sendQueuedReports() {
 	e.igmp.sendQueuedReports()
 }
@@ -1463,7 +1591,6 @@ func (e *endpoint) JoinGroup(addr tcpip.Address) tcpip.Error {
 // joinGroupLocked is like JoinGroup but with locking requirements.
 //
 // +checklocks:e.mu
-// +checklocksalias:e.igmp.ep.mu=e.mu
 func (e *endpoint) joinGroupLocked(addr tcpip.Address) tcpip.Error {
 	if !header.IsV4MulticastAddress(addr) {
 		return &tcpip.ErrBadAddress{}
@@ -1483,7 +1610,6 @@ func (e *endpoint) LeaveGroup(addr tcpip.Address) tcpip.Error {
 // leaveGroupLocked is like LeaveGroup but with locking requirements.
 //
 // +checklocks:e.mu
-// +checklocksalias:e.igmp.ep.mu=e.mu
 func (e *endpoint) leaveGroupLocked(addr tcpip.Address) tcpip.Error {
 	return e.igmp.leaveGroup(addr)
 }
@@ -1492,7 +1618,7 @@ func (e *endpoint) leaveGroupLocked(addr tcpip.Address) tcpip.Error {
 func (e *endpoint) IsInGroup(addr tcpip.Address) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.igmp.isInGroup(addr) // +checklocksforce: e.mu==e.igmp.ep.mu.
+	return e.igmp.isInGroup(addr)
 }
 
 // Stats implements stack.NetworkEndpoint.
@@ -1860,6 +1986,8 @@ func (p *protocol) SendRejectionError(pkt *stack.PacketBuffer, rejectWith stack.
 		return p.returnError(&icmpReasonHostProhibited{}, pkt, inputHook)
 	case stack.RejectIPv4WithICMPAdminProhibited:
 		return p.returnError(&icmpReasonAdministrativelyProhibited{}, pkt, inputHook)
+	case stack.RejectIPv4WithTCPReset:
+		return ip.RejectWithTCPReset(pkt, ProtocolNumber, p.stack, inputHook)
 	default:
 		panic(fmt.Sprintf("unhandled %[1]T = %[1]d", rejectWith))
 	}

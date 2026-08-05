@@ -1,4 +1,4 @@
-// Copyright 2023 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// https://go.dev/cl/670497 (1.25) adds a new wait reason, adjusting the value of waitReasonSemacquire.
-//go:build go1.25
+//go:build arm64 && pagesize_64k
 
-package sync
+package hostarch
 
-// Values for the reason argument to gopark, from Go's src/runtime/runtime2.go.
+import "golang.org/x/sys/unix"
+
 const (
-	WaitReasonSelect      uint8 = 9  // +checkconst runtime waitReasonSelect
-	WaitReasonChanReceive uint8 = 14 // +checkconst runtime waitReasonChanReceive
-	WaitReasonSemacquire  uint8 = 19 // +checkconst runtime waitReasonSemacquire
+	// PageShift is the binary log of the system page size.
+	// 64K pages: 2^16 = 65536
+	PageShift = 16
+
+	// HugePageShift is the binary log of the system huge page size.
+	// For 64K pages: PageShift + (PageShift - 3) = 16 + 13 = 29
+	// This gives 512MB huge pages.
+	HugePageShift = 29
 )
+
+func init() {
+	if size := unix.Getpagesize(); size != PageSize {
+		println("WARNING: host page size mismatch - running on non-64K host")
+	}
+}

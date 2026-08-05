@@ -18,7 +18,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"time"
 
+	"github.com/sagernet/gvisor/pkg/log"
 	"github.com/sagernet/gvisor/pkg/sleep"
 	"github.com/sagernet/gvisor/pkg/sync"
 	"github.com/sagernet/gvisor/pkg/tcpip"
@@ -26,6 +28,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/waiter"
+	"golang.org/x/time/rate"
 )
 
 // epQueue is a queue of endpoints.
@@ -33,7 +36,7 @@ import (
 // +stateify savable
 type epQueue struct {
 	mu   epQueueMutex `state:"nosave"`
-	list endpointList
+	list endpointList `state:"nosave"`
 }
 
 // enqueue adds e to the queue if the endpoint is not already on the queue.
@@ -161,7 +164,7 @@ func handleConnecting(ep *Endpoint) {
 		return
 	}
 	// lx:end handshake-nil-guard
-	if err := ep.h.processSegments(); err != nil { // +checklocksforce:ep.h.ep.mu
+	if err := ep.h.processSegments(); err != nil {
 		// handshake failed. clean up the tcp endpoint and handshake
 		// state.
 		if lEP := ep.h.listenEP; lEP != nil {
@@ -265,6 +268,8 @@ func handleTimeWait(ep *Endpoint) {
 	ep.mu.Unlock()
 }
 
+var warnRateLimiter = rate.NewLimiter(rate.Every(time.Second), 1)
+
 // handleListen is responsible for TCP processing for an endpoint in LISTEN
 // state.
 func handleListen(ep *Endpoint) {
@@ -286,9 +291,11 @@ func handleListen(ep *Endpoint) {
 			break
 		}
 
-		// TODO(gvisor.dev/issue/4690): Better handle errors instead of
-		// silently dropping.
-		_ = ep.handleListenSegment(ep.listenCtx, s)
+		if err := ep.handleListenSegment(ep.listenCtx, s); err != nil {
+			if warnRateLimiter.Allow() {
+				log.Warningf("tcp.Endpoint.handleListenSegment() failed for packet [nic=%d, source=%s, dest=%s, protocol=%d]: %v", s.pkt.NICID, s.pkt.Network().SourceAddress(), s.pkt.Network().DestinationAddress(), s.pkt.NetworkProtocolNumber, err)
+			}
+		}
 		s.DecRef()
 	}
 }

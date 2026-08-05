@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2023 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// https://go.dev/cl/669235 (1.25) adds a new schedt field prior to nmspinning.
-//go:build amd64 && !go1.25
+package sync
 
-#include "textflag.h"
-
-#define NMSPINNING_OFFSET 92 // +checkoffset runtime schedt.nmspinning
-
-TEXT ·addrOfSpinning(SB),NOSPLIT|NOFRAME,$0-8
-	LEAQ runtime·sched(SB), AX
-	ADDQ $NMSPINNING_OFFSET, AX
-	MOVQ AX, ret+0(FP)
-	RET
+// TraceBlockReason constants, from Go's src/runtime/trace2runtime.go.
+const (
+	TraceBlockSelect TraceBlockReason = 3
+	TraceBlockSync   TraceBlockReason = 5
+)

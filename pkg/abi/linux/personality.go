@@ -1,4 +1,4 @@
-// Copyright 2024 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,17 @@
 
 package linux
 
-import "unsafe"
+// Personality flags, used by personality(2),
+// from include/uapi/linux/personality.h.
+const (
+	SHORT_INODE   = 0x1000000
+	WHOLE_SECONDS = 0x2000000
+	PER_LINUX     = 0x0000
+	PER_BSD       = 0x0006
+	PER_HPUX      = 0x0010
+)
 
-// Size returns the number of bytes for a VFIOIrqSet object.
-func (vfioIrqSet VFIOIrqSet) Size() uint64 {
-	return uint64(unsafe.Sizeof(vfioIrqSet))
-}
+// NOTE: All of the above flags are non-security-sensitive and may be copied
+// from parent task to child task. However, this is not the case for all
+// personality bits. If adding more, check PER_CLEAR_ON_SETID and ensure that
+// these are cleared on suid/sgid execs.
